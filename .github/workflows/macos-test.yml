@@ -1,0 +1,34 @@
+# macOS test runs on the KairaCode fork only, never part of an upstream PR. A branch named
+# macos-test/<name> carries the branch under test plus this file (and optionally
+# .github/macos-test.sh, run after the builds). GitHub's macos-latest runner is Apple Silicon;
+# its paravirtual GPU cannot execute Metal submissions, so Metal is compile-only here.
+name: macos-test
+on:
+  push:
+    branches: ['macos-test/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install libomp
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Machine
+        run: sw_vers; uname -m; sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu; vm_stat | head -12
+      - name: Build every engine
+        run: |
+          cd c
+          rc=0
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide deepseek-v4; do
+            echo "::group::$t"; make $t || { echo "FAILED: $t"; rc=1; }; echo "::endgroup::"
+          done
+          exit $rc
+      - name: Branch tests (.github/macos-test.sh)
+        if: hashFiles('.github/macos-test.sh') != ''
+        run: bash .github/macos-test.sh
