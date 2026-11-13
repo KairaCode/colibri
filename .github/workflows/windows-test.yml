@@ -1,0 +1,106 @@
+# Windows test run on the KairaCode fork only, never part of an upstream PR (#2800, #2286).
+# Same MSYS2 setup as upstream ci.yml's "All engines (windows)" job. Leg "runner": the
+# runner's own package list (update: false), which installs what upstream CI got
+# (clang/llvm-openmp 22.1.7). Leg "latest": update: true, today's MSYS2 (23.x).
+name: windows-test
+on:
+  push:
+    branches: ['ci-test/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    name: windows (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: runner
+            update: false
+            want: "22.1.7"
+          - leg: latest
+            update: true
+            want: "23."
+    runs-on: windows-latest
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: "msys2 {0}"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: ${{ matrix.update }}
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-shaderc
+      - name: OpenMP package (as upstream ci.yml)
+        run: |
+          omp=mingw-w64-ucrt-x86_64-llvm-openmp
+          pacman -Si $omp > /dev/null 2>&1 || omp=mingw-w64-ucrt-x86_64-openmp
+          pacman -S --needed --noconfirm $omp
+      # today's MSYS2 ships libgomp.a in its own package (#1900, #2612): the gcc V4 needs it
+      - if: matrix.update
+        run: pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-libgomp
+      - name: Versions and libomp.a symbols
+        run: |
+          pacman -Q mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-llvm-openmp mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-gcc
+          v=$(pacman -Q mingw-w64-ucrt-x86_64-llvm-openmp | awk '{print $2}')
+          case "$v" in ${{ matrix.want }}*) echo "OK: llvm-openmp $v";; *) echo "::warning::leg ${{ matrix.leg }} got llvm-openmp $v, wanted ${{ matrix.want }}";; esac
+          lib=$(clang -print-file-name=libomp.a); echo "$lib"
+          echo "--- nm: omp_get_num_devices"; nm -A "$lib" | grep -i 'omp_get_num_devices' || true
+          echo "--- objdump -t kmp_ftn_extra member"; mkdir -p /tmp/omp && cd /tmp/omp && ar x "$lib" kmp_ftn_extra.cpp.obj && objdump -t kmp_ftn_extra.cpp.obj | grep -i 'num_devices' || true
+          echo "--- the Makefile's probe by hand"
+          echo 'int omp_get_num_devices(void); int main(void) { return omp_get_num_devices(); }' | clang -x c - -fopenmp -static -o /tmp/omp/p.exe && echo "probe links" || echo "probe fails"
+      - name: "Diagnosis: the other libomp.a with this leg's ld"
+        continue-on-error: true
+        run: |
+          other=$([ "${{ matrix.leg }}" = runner ] && echo 23.1.5-1 || echo 22.1.7-1)
+          mkdir -p /tmp/other && cd /tmp/other
+          curl -fsSLO https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-llvm-openmp-$other-any.pkg.tar.zst
+          tar -xf mingw-w64-ucrt-x86_64-llvm-openmp-$other-any.pkg.tar.zst ucrt64/lib/libomp.a
+          ld --version | head -1
+          echo 'int omp_get_num_devices(void); int main(void) { return omp_get_num_devices(); }' | clang -x c - -fopenmp -static -L/tmp/other/ucrt64/lib -o p.exe -Wl,--trace 2>&1 | grep -i 'libomp\|undefined' | head
+          test -f p.exe && echo "libomp $other + this ld: links" || echo "libomp $other + this ld: fails"
+      - name: deepseek-v4 (gcc, as upstream's loop)
+        run: cd c && make deepseek-v4 XDNA=1
+      - name: deepseek-v4 CC=clang VK=1 (the step that failed in #2805)
+        run: |
+          cd c
+          make deepseek-v4 XDNA=1 CC=clang VK=1
+          grep -c COLI_OMP_NUM_DEVICES_STUB deepseek_v4.cflags && echo "stub: on" || echo "stub: off"
+          ls -l deepseek_v4.exe
+          grep -aq KMP_BLOCKTIME deepseek_v4.exe || { echo "FAIL: not a libomp build"; exit 1; }
+          objdump -p deepseek_v4.exe | sed -n 's/.*DLL Name: //p'
+          if objdump -p deepseek_v4.exe | grep -i 'DLL Name: lib'; then echo "FAIL: imports a MinGW DLL"; exit 1; fi
+      - name: release.yml's line (CC=clang, XDNA=1 VK=1)
+        run: cd c && make deepseek-v4 XDNA=1 VK=1 CC=clang && ls -l deepseek_v4.exe
+      - name: Tiny fixture oracle with the clang build (token-exact)
+        run: |
+          cd c
+          python -m pip install -q -r tools/requirements-deepseek-v4-tiny.txt
+          python tools/make_deepseek_v4_tiny.py --output ./deepseek_v4_tiny --force
+          python tests/test_deepseek_v4_tiny.py --binary ./deepseek_v4.exe --fixture ./deepseek_v4_tiny
+      - name: Makefile platform tests (real clang on the probe)
+        run: cd c && python -m unittest -v tests.test_makefile_platform
+
+  linux-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: The PR's Python tests
+        run: cd c && python -m unittest tests.test_makefile_platform tests.test_cli_output tests.test_env_defaults tests.test_openai_server
