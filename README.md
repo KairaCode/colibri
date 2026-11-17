@@ -13,6 +13,14 @@
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
+> **This fork adds WEX4 and WNR3.** Its `main` is colibri's `dev` plus a WEX4 expert container for the MoE
+> engines (DeepSeek V4, V4.1, Qwen3.8, GLM-5.3-Flash): one aligned read per routed expert, a pinned SHA-256
+> root, and WNR3, a lossless codec for MXFP4 experts (0.854-0.89 of their size) decoded on the CPU or on an
+> NVIDIA GPU. Nothing changes unless `COLI_WEX_PATH` is set.
+> [What it is and the results](docs/wex4-colibri-series.md) · [WEX in the engines](docs/wex.md) ·
+> [the bench](docs/wex-bench.md) · **[tests wanted, help welcome](https://github.com/KairaCode/colibri/issues/1)** ·
+> format and codec: [KairaCode/Wex-WRN2](https://github.com/KairaCode/Wex-WRN2)
+
 **Tiny engine, immense model.** colibri runs very large open models on the
 machine you already have. A mixture-of-experts model of hundreds of billions of
 parameters uses only a small part of itself for each token, so colibri keeps

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wex_bench.py -- the WEX measurements of #2860 in one command, with a report to paste there.
+"""wex_bench.py -- the WEX measurements of KairaCode/colibri#1 in one command, with a report to paste there.
 
     python3 c/tools/wex_bench.py STAGE [STAGE ...] [options]
 

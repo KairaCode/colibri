@@ -146,7 +146,7 @@ comes from the one call they make); a RAW container prints no line. Unset or `0`
 ### Measuring
 
 `c/tools/wex_bench.py` runs the decode, read, verify and engine measurements on one machine and
-writes a report for #2860; `c/tools/wex_decode_bench` is its C part ([wex-bench.md](wex-bench.md)).
+writes a report for KairaCode/colibri#1; `c/tools/wex_decode_bench` is its C part ([wex-bench.md](wex-bench.md)).
 
 ## Checking a container
 

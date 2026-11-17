@@ -1,17 +1,17 @@
 # WEX bench
 
-`c/tools/wex_bench.py` runs the measurements the WEX series asks helpers for (#2860) and writes a
+`c/tools/wex_bench.py` runs the measurements the WEX series asks helpers for (KairaCode/colibri#1, Tests wanted) and writes a
 report to paste there. Python 3, standard library only; it builds the two C tools it needs
 (`tools/wex4_verify`, `tools/wex_decode_bench`) with `make -C c` when they are missing.
 
 ```sh
 python3 c/tools/wex_bench.py all --container v4_flash_experts.nr3.wex --out bench-out
-# then paste bench-out/wex-bench-report.md as a comment on #2860
+# then paste bench-out/wex-bench-report.md as a comment on KairaCode/colibri#1
 ```
 
 ## Containers
 
-- The published ones (#2860 links the Hugging Face repository):
+- The published ones (KairaCode/colibri#1 links the Hugging Face repository):
   `v41-reap/v4_flash_experts.nr3.wex` (DeepSeek V4.1 Flash REAP-192, 7,680 WNR3 records, 123.3 GB) and
   `qwen38-mxfp4/q38_experts.wex` (Qwen3.8-Flash-Next, 24,576 RAW records, 64.3 GB).
 - Your own: a RAW WEX4 file with Wex-WRN2's `wex4/wex4_convert.py pack`, a WNR3 one with

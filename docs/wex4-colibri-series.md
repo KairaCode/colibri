@@ -255,7 +255,7 @@ colibri's CI is not waited on: its maintainer cancels it, so every result here i
 
 ## Tests wanted
 
-See the "Tests wanted (help welcome)" section of JustVugg/colibri#2860. It lists each missing test
+See KairaCode/colibri#1 (tests wanted, open for reports; the same list as the "Tests wanted" section of JustVugg/colibri#2860). It lists each missing test
 with the hardware, the `c/tools/wex_bench.py` command, and what to expect.
 
 ## What is left
