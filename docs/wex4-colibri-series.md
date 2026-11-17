@@ -9,7 +9,7 @@ can still be reviewed commit by commit. The PR numbers below are those of JustVu
 Those 20 drafts were closed on 2026-11-17, and their discussion stays there for reference. The
 consolidated series lives only on this fork: nothing of it is proposed to JustVugg/colibri.
 
-Tracking issue: JustVugg/colibri#2860. Its "Tests wanted" section is the list of tests still
+Tracking issue: JustVugg/colibri#2860 (copied in [wex4-colibri-texts/issue-2860.md](wex4-colibri-texts/issue-2860.md)). Its "Tests wanted" section is the list of tests still
 missing.
 
 ## What WEX4 and WNR3 are
