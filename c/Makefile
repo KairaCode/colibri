@@ -1566,6 +1566,17 @@ cuda-dflash-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_dflash_test$(EXE)
 
+# A GGUF's block formats on the card (cuda_bd.cuh): the GEMV, the verify's rows, the routed
+# experts, the f16 tiles of a prompt chunk and the tensor cores' integer steps, against the CPU's
+# decoders (ggml_quants.h through tests/cuda_bd_ref.c, built as C: its designated initializers
+# are C's). Needs a GPU; about a minute on an sm_86 card. Windows: from a vcvars64 shell.
+.PHONY: cuda-bd-test
+cuda-bd-test: tests/test_cuda_bd.cu tests/cuda_bd_ref.c ggml_quants.h cuda_bd.cuh backend_cuda.cu backend_cuda.h
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -fno-openmp -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_bd.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_bd_ref.o -o cuda_bd_test$(EXE) $(GPU_TEST_LIBS)
+	./cuda_bd_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 

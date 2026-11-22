@@ -16,7 +16,8 @@
  *   - the tensor cores' integer steps (bd_mmg_launch, sm_80 on) of 1 to 8 rows, each row the bits
  *     of the GEMV's same row alone; again with x's quantization kept (g_bd_x_same), and after
  *     another x at the same address without it.
- * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
+ * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. `make cuda-bd-test` builds and runs it
+ * (Linux, and Windows from a vcvars64 shell); by hand, from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
  *   nvcc -O2 -std=c++17 -arch=native tests/test_cuda_bd.cu tests/cuda_bd_ref.o -o tests/test_cuda_bd */
 #include <cstdio>
@@ -25,6 +26,14 @@
 #include <cmath>
 #include <ctime>
 #include <cuda_runtime.h>
+#ifdef _WIN32
+/* MSVC has neither clock_gettime nor strtok_r: C11's timespec_get and strtok_s in their place */
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+static inline int clock_gettime(int, struct timespec *t) { return timespec_get(t, TIME_UTC) ? 0 : -1; }
+#endif
+#define strtok_r strtok_s
+#endif
 #include "../backend_cuda.cu"
 
 extern "C" {
