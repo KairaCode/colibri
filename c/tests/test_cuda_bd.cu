@@ -15,7 +15,9 @@
  *     two GEMVs and the elementwise product;
  *   - the tensor cores' integer steps (bd_mmg_launch, sm_80 on) of 1 to 8 rows, each row the bits
  *     of the GEMV's same row alone; again with x's quantization kept (g_bd_x_same), and after
- *     another x at the same address without it.
+ *     another x at the same address without it;
+ *   - a prompt chunk's x rows and SwiGLU hidden rows in int8 (cuda_moe_i8.cuh), the CPU's codes,
+ *     scales and sums bit for bit, and bdx_quant_k's.
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. `make cuda-bd-test` builds and runs it
  * (Linux, and Windows from a vcvars64 shell); by hand, from c/:
  *   gcc -O2 -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
@@ -35,6 +37,7 @@ static inline int clock_gettime(int, struct timespec *t) { return timespec_get(t
 #define strtok_r strtok_s
 #endif
 #include "../backend_cuda.cu"
+#include "../cuda_moe_i8.cuh"
 
 extern "C" {
 int ref_unpack(int t, const uint8_t *row, int n, int8_t *w8, float *sw, float *mw);
@@ -767,6 +770,125 @@ static void check_xq_forget(void) {
     free(w); free(x); free(x2); free(want); free(got);
 }
 
+/* cuda_moe_i8.cuh: a prompt chunk's rows in int8 (cmi_quant_rows: S rows of K at a row stride) against
+ * the CPU's quantization (ref_quant, gq_quant_act_ref) code for code, scale for scale (their bits), sum for
+ * sum, and against bdx_quant_k's global form of the same rows (the GEMV's); random rows of either sign at
+ * magnitudes 1e-4 .. 1e2 a row, a block of zeros, a block of one value, a block whose values are multiples
+ * of its maximum / 127 (exact halves after the scale: round to even). */
+static void cmi_fill(float *x, int S, int K, int x_row) {
+    for (int r = 0; r < S; r++) {
+        const float mag = powf(10.f, -4.f + (float)(rnd() % 7));
+        float *v = x + (size_t)r * x_row;
+        for (int i = 0; i < x_row; i++) v[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f * mag;
+        const int nb = K / 32, b0 = (int)(rnd() % nb);
+        if (r % 3 == 0) memset(v + 32 * b0, 0, 32 * 4);
+        if (r % 5 == 1) for (int i = 0; i < 32; i++) v[32 * ((b0 + 1) % nb) + i] = i == 7 ? -mag : 0.f;
+        if (r % 7 == 2) {   /* the maximum, then values about k + 1/2 of its 127ths */
+            float *w = v + 32 * ((b0 + 2) % nb);
+            w[0] = mag;
+            for (int i = 1; i < 32; i++) w[i] = mag * ((float)((int)(rnd() % 254) - 127) + 0.5f) / 127.f;
+        }
+    }
+}
+/* X's planes (n rows of K) against ref_quant of the float rows h (row stride h_row), bit for bit */
+static int cmi_same(const char *what, const float *h, int h_row, int n, int K, void *dX) {
+    const size_t xb = cmi_x_bytes((size_t)n, K);
+    char *hX = (char *)malloc(xb);
+    cudaMemcpy(hX, dX, xb, cudaMemcpyDeviceToHost);
+    const CmiX X = cmi_x_at(hX, (size_t)n, K);
+    int8_t *xq = (int8_t *)malloc((size_t)K); float *dx = (float *)malloc((size_t)K / 32 * 4); int32_t *xs = (int32_t *)malloc((size_t)K / 16 * 4);
+    long bad = 0, first = -1;
+    for (int r = 0; r < n; r++) {
+        ref_quant(h + (size_t)r * h_row, K, xq, dx, xs);
+        int ok = !memcmp(xq, X.q + (size_t)r * K, (size_t)K) && !memcmp(dx, X.d + (size_t)r * (K / 32), (size_t)K / 32 * 4) &&
+                 !memcmp(xs, X.s + (size_t)r * (K / 16), (size_t)K / 16 * 4);
+        if (!ok) { bad++; if (first < 0) first = r; }
+    }
+    if (bad) { printf("FAIL i8 %s [%d x %d]: %ld rows differ from the CPU's quantization (first %ld)\n", what, n, K, bad, first); fails++; }
+    else printf("i8 %-28s [%6d x %5d]: the CPU's codes, scales and sums, bit for bit\n", what, n, K);
+    free(hX); free(xq); free(dx); free(xs);
+    return bad == 0;
+}
+static void check_i8_rows(int S, int K, int x_row) {
+    const int off = 8;   /* x from a row's eighth float (CcMoe.x_off) */
+    float *x = (float *)malloc(((size_t)S * x_row + off) * 4);
+    for (int i = 0; i < off; i++) x[i] = 1e9f;
+    cmi_fill(x + off, S, K, x_row);
+    float *dx; void *dX; uint4 *gq;
+    const size_t xb = cmi_x_bytes((size_t)S, K);
+    int ok = cudaMalloc(&dx, ((size_t)S * x_row + off) * 4) == cudaSuccess && cudaMalloc(&dX, xb) == cudaSuccess && cudaMalloc(&gq, bd_x_bytes(K, S)) == cudaSuccess;
+    if (!ok) { printf("FAIL i8 rows S %d: no device memory\n", S); fails++; free(x); return; }
+    cudaMemcpy(dx, x, ((size_t)S * x_row + off) * 4, cudaMemcpyHostToDevice);
+    cudaMemset(dX, 0xAB, xb);
+    CmiX X = cmi_x_at(dX, (size_t)S, K);
+    ok = cmi_quant_rows(dx + off, x_row, S, X, 0) && cudaDeviceSynchronize() == cudaSuccess;
+    char what[64];
+    snprintf(what, sizeof what, "x rows (stride %d)", x_row);
+    if (!ok) { printf("FAIL i8 %s S %d: the launch failed\n", what, S); fails++; }
+    else if (cmi_same(what, x + off, x_row, S, K, dX)) {
+        /* the GEMV's global form of the same rows (bdx_quant_k): the same codes, scales and sums */
+        bdx_quant_launch(dx + off, S, K, x_row, gq, 0);
+        const size_t gb = bd_x_bytes(K, S);
+        char *hg = (char *)malloc(gb), *hX = (char *)malloc(xb);
+        int same = cudaDeviceSynchronize() == cudaSuccess && cudaMemcpy(hg, gq, gb, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                   cudaMemcpy(hX, dX, xb, cudaMemcpyDeviceToHost) == cudaSuccess;
+        const CmiX H = cmi_x_at(hX, (size_t)S, K);
+        const uint4 *q = (const uint4 *)hg;
+        const float *gd = (const float *)(q + (size_t)S * bd_xq_row(K));
+        const int *gs = (const int *)(gd + (size_t)S * (K / 32));
+        for (int r = 0; r < S && same; r++)
+            for (int k = 0; k < K / 16 && same; k++)
+                same = !memcmp(&q[(size_t)r * bd_xq_row(K) + bd_x4(k)], H.q + (size_t)r * K + 16 * k, 16) && gs[(size_t)r * (K / 16) + k] == H.s[(size_t)r * (K / 16) + k] &&
+                       (k & 1 || !memcmp(&gd[(size_t)r * (K / 32) + k / 2], &H.d[(size_t)r * (K / 32) + k / 2], 4));
+        if (!same) { printf("FAIL i8 x rows S %d K %d: other bits than bdx_quant_k's\n", S, K); fails++; }
+        else printf("i8 %-28s [%6d x %5d]: bdx_quant_k's codes, scales and sums too\n", "x rows, the GEMV's form", S, K);
+        free(hg); free(hX);
+    }
+    /* shapes not taken: K not of 32s, a row stride short of K or not of float4s */
+    check_ok(!cmi_quant_rows(dx, K + 16, S, cmi_x_at(dX, (size_t)S, K + 16), 0) && !cmi_quant_rows(dx, K - 4, S, X, 0) &&
+             !cmi_quant_rows(dx, K + 2, S, X, 0) && !cmi_quant_rows(dx + 1, x_row, S, X, 0), "i8 rows: shapes and alignments it does not take refused");
+    cudaFree(dx); cudaFree(dX); cudaFree(gq); free(x);
+}
+/* the SwiGLU hidden rows (cmi_quant_swiglu: n slots' gate and up of I values, apart and as one [g | u] row)
+ * against ref_quant of silu(g) * u (CC_EW_SWIGLU's, swiglu_ref_k on the device), bit for bit */
+static void check_i8_swiglu(int n, int I) {
+    float *gu = (float *)malloc((size_t)n * 2 * I * 4), *h = (float *)malloc((size_t)n * I * 4);
+    for (size_t i = 0; i < (size_t)n * 2 * I; i++) gu[i] = ((int)(rnd() % 20001) - 10000) * 1e-3f;   /* -10 .. 10 */
+    float *dgu, *dg, *du, *dh; void *dX;
+    const size_t xb = cmi_x_bytes((size_t)n, I);
+    int ok = cudaMalloc(&dgu, (size_t)n * 2 * I * 4) == cudaSuccess && cudaMalloc(&dg, (size_t)n * I * 4) == cudaSuccess &&
+             cudaMalloc(&du, (size_t)n * I * 4) == cudaSuccess && cudaMalloc(&dh, (size_t)n * I * 4) == cudaSuccess && cudaMalloc(&dX, xb) == cudaSuccess;
+    if (!ok) { printf("FAIL i8 swiglu n %d: no device memory\n", n); fails++; free(gu); free(h); return; }
+    cudaMemcpy(dgu, gu, (size_t)n * 2 * I * 4, cudaMemcpyHostToDevice);
+    /* the planar copies: g rows, u rows */
+    cudaMemcpy2D(dg, (size_t)I * 4, dgu, (size_t)2 * I * 4, (size_t)I * 4, (size_t)n, cudaMemcpyDeviceToDevice);
+    cudaMemcpy2D(du, (size_t)I * 4, dgu + I, (size_t)2 * I * 4, (size_t)I * 4, (size_t)n, cudaMemcpyDeviceToDevice);
+    swiglu_ref_k<<<(unsigned)(((size_t)n * I + 255) / 256), 256>>>(dh, dg, du, n * I);
+    ok = cudaDeviceSynchronize() == cudaSuccess && cudaMemcpy(h, dh, (size_t)n * I * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    const CmiX X = cmi_x_at(dX, (size_t)n, I);
+    cudaMemset(dX, 0xAB, xb);
+    int a = ok && cmi_quant_swiglu(dg, du, I, n, X, 0) && cudaDeviceSynchronize() == cudaSuccess;
+    if (!a) { printf("FAIL i8 swiglu n %d: the launch failed\n", n); fails++; }
+    else cmi_same("swiglu hidden (g, u apart)", h, I, n, I, dX);
+    cudaMemset(dX, 0xAB, xb);
+    a = ok && cmi_quant_swiglu(dgu, dgu + I, 2 * I, n, X, 0) && cudaDeviceSynchronize() == cudaSuccess;
+    if (!a) { printf("FAIL i8 swiglu [g | u] n %d: the launch failed\n", n); fails++; }
+    else cmi_same("swiglu hidden ([g | u] rows)", h, I, n, I, dX);
+    /* the float rows the activation wrote, through cmi_quant_rows: the same planes (memcmp) */
+    void *dY = NULL;
+    if (a && cudaMalloc(&dY, xb) == cudaSuccess) {
+        char *p0 = (char *)malloc(xb), *p1 = (char *)malloc(xb);
+        cudaMemset(dY, 0xAB, xb);
+        int same = cmi_quant_rows(dh, I, n, cmi_x_at(dY, (size_t)n, I), 0) && cudaDeviceSynchronize() == cudaSuccess &&
+                   cudaMemcpy(p0, dX, xb, cudaMemcpyDeviceToHost) == cudaSuccess && cudaMemcpy(p1, dY, xb, cudaMemcpyDeviceToHost) == cudaSuccess && !memcmp(p0, p1, xb);
+        char what[96];
+        snprintf(what, sizeof what, "i8 swiglu n %d: the epilogue's planes the bits of cmi_quant_rows on its float rows", n);
+        check_ok(same, what);
+        free(p0); free(p1); cudaFree(dY);
+    }
+    cudaFree(dgu); cudaFree(dg); cudaFree(du); cudaFree(dh); cudaFree(dX); free(gu); free(h);
+}
+
 int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("SKIP: no CUDA device\n"); return 0; }
@@ -838,6 +960,11 @@ int main(void) {
             check_xq_forget();
         } else printf("mmq: SKIP (compute capability %d, the tensor cores' integer steps need 8)\n", major);
     }
+    /* after the tests above (their random draws kept): a prompt chunk's activations in int8 (cuda_moe_i8.cuh),
+     * Qwen3.8's x rows (2560) and hidden rows (640, ten slots a row) of chunks of 40 and 2100 rows; a row of
+     * 65 blocks (not of 128s) at a padded stride */
+    for (int S : {40, 2100}) { check_i8_rows(S, 2560, 2560); check_i8_swiglu(S * 10, 640); }
+    check_i8_rows(40, 2080, 2084);
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};

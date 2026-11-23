@@ -1571,9 +1571,9 @@ cuda-dflash-check: backend_cuda.o cuda_chain.o
 # decoders (ggml_quants.h through tests/cuda_bd_ref.c, built as C: its designated initializers
 # are C's). Needs a GPU; about a minute on an sm_86 card. Windows: from a vcvars64 shell.
 .PHONY: cuda-bd-test
-cuda-bd-test: tests/test_cuda_bd.cu tests/cuda_bd_ref.c ggml_quants.h cuda_bd.cuh backend_cuda.cu backend_cuda.h
+cuda-bd-test: tests/test_cuda_bd.cu tests/cuda_bd_ref.c ggml_quants.h cuda_bd.cuh cuda_moe_i8.cuh backend_cuda.cu backend_cuda.h
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -fno-openmp -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
+	$(CC) $(filter-out -MMD -MP -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -Wno-unknown-pragmas -c tests/cuda_bd_ref.c -o tests/cuda_bd_ref.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_bd.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_bd_ref.o -o cuda_bd_test$(EXE) $(GPU_TEST_LIBS)
 	./cuda_bd_test$(EXE)
 
