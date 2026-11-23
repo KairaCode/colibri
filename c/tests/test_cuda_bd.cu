@@ -34,7 +34,9 @@
 #define CLOCK_MONOTONIC 1
 static inline int clock_gettime(int, struct timespec *t) { return timespec_get(t, TIME_UTC) ? 0 : -1; }
 #endif
+#ifndef strtok_r
 #define strtok_r strtok_s
+#endif
 #endif
 #include "../backend_cuda.cu"
 #include "../cuda_moe_i8.cuh"
@@ -962,9 +964,10 @@ int main(void) {
     }
     /* after the tests above (their random draws kept): a prompt chunk's activations in int8 (cuda_moe_i8.cuh),
      * Qwen3.8's x rows (2560) and hidden rows (640, ten slots a row) of chunks of 40 and 2100 rows; a row of
-     * 65 blocks (not of 128s) at a padded stride */
+     * 65 blocks (not of 128s) at a padded stride, and hidden rows of 65 blocks (the SwiGLU kernel's last group) */
     for (int S : {40, 2100}) { check_i8_rows(S, 2560, 2560); check_i8_swiglu(S * 10, 640); }
     check_i8_rows(40, 2080, 2084);
+    check_i8_swiglu(40, 2080);
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};
