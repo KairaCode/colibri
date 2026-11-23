@@ -1611,6 +1611,15 @@ cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tes
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
 
+# The tensor cores' sustained rate per mma.sync form (f16 with f32 or f16 sums, int8 k16 and
+# k32), operands in registers and from shared memory as the f16 tiles read them: whether a
+# card's int8 tiles have room over f16 with f32 sums. Self-contained, no backend; run explicitly.
+.PHONY: mma-rate-bench
+mma-rate-bench: tests/bench_mma_rate.cu
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) tests/bench_mma_rate.cu -o bench_mma_rate$(EXE)
+	./bench_mma_rate$(EXE)
+
 # fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
 # expert shapes, JSON on stdout (kernel time only). The build is a separate
 # file target so tools/run_f8_bench.sh can keep stdout pure JSON.
