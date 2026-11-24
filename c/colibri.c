@@ -1237,13 +1237,13 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
-                    au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                    ag=i4g_step2(ag,xs[i],(float)((int)(bg&0xF)-8),xs[i+1],(float)((int)(bg>>4)-8),scg);
+                    au=i4g_step2(au,xs[i],(float)((int)(bu&0xF)-8),xs[i+1],(float)((int)(bu>>4)-8),scu);
                 }
                 if(i<base+glen){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
-                    au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                    ag=i4g_step1(ag,xs[i],(float)((int)(bg&0xF)-8),scg);
+                    au=i4g_step1(au,xs[i],(float)((int)(bu&0xF)-8),scu);
                 }
             }
             yg[(int64_t)s*O+o]=ag; yu[(int64_t)s*O+o]=au;
@@ -14233,7 +14233,15 @@ int main(int argc, char **argv){
          * 200 ms of blocktime keeps the team hot across back-to-back expert matmuls
          * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
          * the user's own setting authoritative. */
+#ifdef __FreeBSD__
+        /* FreeBSD: 0, so libomp's team sleeps as soon as a region ends. With 200 a
+         * GLM-5.3 decode began at about 0.9 tok/s and fell to 0.3-0.4 within 64
+         * tokens (2x Xeon Gold 6230, 40 threads, every core at 100% user); with 0 it
+         * held 0.92-0.98. libgomp ignores KMP_*, so a gcc build is not affected. */
+        setenv("KMP_BLOCKTIME","0",0);
+#else
         setenv("KMP_BLOCKTIME","200",0);
+#endif
 #else
         fprintf(stderr,"[OMP] hot-thread tuning skipped on macOS (#707): spin-wait knobs "
                        "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");
