@@ -62,8 +62,9 @@ struct CcCtx {
     int f2_b3[2], f2_m3[2], f2_b6[2];   /* the same for its three- and six-warp kernels (12 query heads a kv head), [float16 cache] */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
-    /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
-    cudaStream_t cs; cudaEvent_t ev_fetched, ev_free; int cs_ok;
+    /* staging (cc_fetch): the copy stream, and for each of its two banks the copies' event and the
+     * buffer's last reader's */
+    cudaStream_t cs; cudaEvent_t ev_fetched[2], ev_free[2]; int cs_ok;
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
@@ -1742,6 +1743,9 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
         y[p.y_off + i] = cc_f16_round(a[p.a_off + i]);
     } else if (p.op == 12) {   /* LFM3's head gate: one logit a head of D values */
         y[p.y_off + i] = a[p.a_off + i] * cc_sig(b[p.b_off + i / p.D]);
+    } else if (p.op == 13) {   /* Inkling-2-Mini's loop gate, ink2_loop_gate's last line: y may be c */
+        float h = c[p.c_off + i];
+        y[p.y_off + i] = (1.f - tanhf(a[p.a_off + i])) * h + tanhf(b[p.b_off + i]) * e[p.e_off + i];
     }
 }
 
@@ -2036,7 +2040,8 @@ static void cc_shutdown(void) {
             cudaStreamDestroy(c->stream);
             if (c->cs_ok) {
                 if (!c->lost) cudaStreamSynchronize(c->cs);
-                cudaEventDestroy(c->ev_fetched); cudaEventDestroy(c->ev_free); cudaStreamDestroy(c->cs);
+                for (int s = 0; s < 2; s++) { cudaEventDestroy(c->ev_fetched[s]); cudaEventDestroy(c->ev_free[s]); }
+                cudaStreamDestroy(c->cs);
             }
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
             c->up_made = 0; c->up_seq = 0;
@@ -2931,6 +2936,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_SIGMUL: if (!a || !b) return 0; break;
     case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
     case CC_EW_HEADGATE: if (!a || !b || p->D < 1) return 0; break;   /* LFM3's gate a head (cc_lfm3) */
+    case CC_EW_LOOPGATE: if (!a || !b || !cb || !e) return 0; break;  /* Inkling-2-Mini's loop gate */
     default: return 0;
     }
     coli_launch(cc_ew_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
@@ -2987,6 +2993,10 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (LS > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
+    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
+    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
+        (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
+        (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     g_st.ops++;
     if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
                              (void *)c->stream)) { c->lost = 1; return 0; }
@@ -3097,41 +3107,44 @@ static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 static int cc_copy_stream(CcCtx *c) {
     if (c->cs_ok) return 1;
     if (!cc_ok(c, cudaStreamCreateWithFlags(&c->cs, cudaStreamNonBlocking), "copy stream")) return 0;
-    if (cudaEventCreateWithFlags(&c->ev_fetched, cudaEventDisableTiming) != cudaSuccess) {
+    cudaEvent_t *ev[4] = {&c->ev_fetched[0], &c->ev_fetched[1], &c->ev_free[0], &c->ev_free[1]};
+    for (int s = 0; s < 4; s++) {
+        if (cudaEventCreateWithFlags(ev[s], cudaEventDisableTiming) == cudaSuccess) continue;
+        while (s--) (void)cudaEventDestroy(*ev[s]);
         (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
-    }
-    if (cudaEventCreateWithFlags(&c->ev_free, cudaEventDisableTiming) != cudaSuccess) {
-        (void)cudaEventDestroy(c->ev_fetched); (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
     }
     c->cs_ok = 1;
     return 1;
 }
-static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) {
+static int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) {
     CcCtx *c = live();
-    if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r)) return 0;
+    if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r) || (unsigned)bank > 1) return 0;
     for (int i = 0; i < n; i++) if (!r[i].src || r[i].dst > dst->bytes || r[i].bytes > dst->bytes - r[i].dst) return 0;
     if (!cc_copy_stream(c)) return 0;
     /* an event never recorded is no wait: the first fetch starts at once */
-    if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free, 0), "fetch's reader")) return 0;
+    if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free[bank], 0), "fetch's reader")) return 0;
     for (int i = 0; i < n; i++) {
         if (!r[i].bytes) continue;
         if (!cc_ok(c, cudaMemcpyAsync((char *)dst->d + r[i].dst, r[i].src, r[i].bytes, cudaMemcpyHostToDevice, c->cs), "fetch")) return 0;
         g_st.bytes_up += r[i].bytes;
     }
     g_st.ops++;
-    return cc_ok(c, cudaEventRecord(c->ev_fetched, c->cs), "fetch event");
+    return cc_ok(c, cudaEventRecord(c->ev_fetched[bank], c->cs), "fetch event");
 }
-static int cc_fetch_wait(void) {
+static int cc_fetch_wait_at(int bank) {
     CcCtx *c = live();
-    if (!c || !c->cs_ok) return 0;
+    if (!c || !c->cs_ok || (unsigned)bank > 1) return 0;
     g_st.ops++;
-    return cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_fetched, 0), "fetch wait");
+    return cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_fetched[bank], 0), "fetch wait");
 }
-static int cc_fetch_done(void) {
+static int cc_fetch_done_at(int bank) {
     CcCtx *c = live();
-    if (!c || !c->cs_ok) return 0;
-    return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
+    if (!c || !c->cs_ok || (unsigned)bank > 1) return 0;
+    return cc_ok(c, cudaEventRecord(c->ev_free[bank], c->stream), "fetch done");
 }
+static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_at(dst, r, n, 0); }
+static int cc_fetch_wait(void) { return cc_fetch_wait_at(0); }
+static int cc_fetch_done(void) { return cc_fetch_done_at(0); }
 /* host_up's events: the frame's point a copy waits for, the ring of marks */
 static int cc_up_events(CcCtx *c) {
     if (!c->up_made) {
@@ -3682,8 +3695,15 @@ static int cc_preload(void) {
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
+/* COLI_CUDA_RELATTN_SPLIT=0: a decode step's Inkling-2 attention a block a (head, row) (cuda_inkc.cuh) */
+static int cc_relattn_split(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_SPLIT"); on = !(e && *e == '0'); }
+    return on;
+}
 #include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
+static int cc_ink2_caps_(void) { return CC_INK2_MOE | CC_INK2_LOOPGATE; }
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3723,5 +3743,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_dflash, cc_dfconv, cc_dftopk, cc_dftap,
     cc_wait_host_if,
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
+    cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
+    cc_ink2_caps_,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
