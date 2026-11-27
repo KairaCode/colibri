@@ -20,7 +20,8 @@
 #define WEX4_PAGE 4096u
 #define WEX4_HEADER_HASHED 4064u               /* header_sha256 = SHA-256(page[0..4064)) at 4064 */
 #define WEX4_REQ_VALUE_EXACT UINT64_C(1)       /* some records are value-exact, not byte-exact */
-#define WEX4_REQUIRED_KNOWN WEX4_REQ_VALUE_EXACT
+#define WEX4_REQ_WNR4_EXPERT UINT64_C(4)       /* WNR4 (codec 8) or NVFP4 on EXPERT records */
+#define WEX4_REQUIRED_KNOWN (WEX4_REQ_VALUE_EXACT | WEX4_REQ_WNR4_EXPERT)
 #define WEX4_OPT_ST_SOURCES UINT64_C(1)        /* meta holds the safetensors sources (tools only) */
 #define WEX4_MAX_BLOBS (1u << 16)
 #define WEX4_MAX_RECORDS (1u << 24)
@@ -228,7 +229,11 @@ static inline void wex4_sha_blocks(uint32_t h[8], const unsigned char *p, size_t
     else for (; n >= 64u; p += 64u, n -= 64u) wex4_sha_block(h, p);
 }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_SHA2)
+#if defined(_MSC_VER)
+#include <arm64_neon.h>
+#else
 #include <arm_neon.h>
+#endif
 /* ARMv8 Crypto SHA-256 compression function: 4 live NEON message-schedule registers (m0..m3). */
 static inline void wex4_sha_blocks(uint32_t h[8], const unsigned char *p, size_t n) {
     uint32x4_t s0, s1;
@@ -295,6 +300,7 @@ static inline void wex4_sha_init(Wex4Sha *s) {
 }
 static inline void wex4_sha_update(Wex4Sha *s, const unsigned char *p, size_t n) {
     size_t fill = (size_t)(s->n & 63u);
+    if (!n) return;
     s->n += n;
     if (fill) {
         size_t take = 64u - fill < n ? 64u - fill : n;

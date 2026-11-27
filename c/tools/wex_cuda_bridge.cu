@@ -177,14 +177,16 @@ struct WexCudaSingle {
 struct WexCudaNr2Model {
     uint32_t id;
     unsigned char blob[WEX_NR2_MODEL_BYTES];
-    unsigned char *tables[WEX_CUDA_NR2_MAX_DEVICES];
+    std::atomic<unsigned char *> tables[WEX_CUDA_NR2_MAX_DEVICES];
+    WexCudaNr2Model() : id(0) { for(int i=0;i<WEX_CUDA_NR2_MAX_DEVICES;i++) tables[i].store(nullptr,std::memory_order_relaxed); }
 };
 static std::mutex wex_cuda_nr2_mutex;
 static WexCudaNr2Model *wex_cuda_nr2_models[WEX_CUDA_NR2_MAX_MODELS];
-static int wex_cuda_nr2_count;
+static std::atomic<int> wex_cuda_nr2_count{0};
 
-static WexCudaNr2Model *wex_cuda_nr2_find(uint32_t id) {   /* caller holds the mutex */
-    for(int i=0;i<wex_cuda_nr2_count;i++) if(wex_cuda_nr2_models[i]->id==id) return wex_cuda_nr2_models[i];
+static WexCudaNr2Model *wex_cuda_nr2_find(uint32_t id) {
+    int n=wex_cuda_nr2_count.load(std::memory_order_acquire);
+    for(int i=0;i<n;i++) if(wex_cuda_nr2_models[i]->id==id) return wex_cuda_nr2_models[i];
     return nullptr;
 }
 
@@ -192,12 +194,15 @@ static WexCudaNr2Model *wex_cuda_nr2_find(uint32_t id) {   /* caller holds the m
  * building them on `stream` the first time; 1 if the model is not registered
  * or CUDA fails. */
 static int wex_cuda_nr2_tables(uint32_t id,int device,cudaStream_t stream,WexCudaNr2Tables *tables) {
-    std::lock_guard<std::mutex> lock(wex_cuda_nr2_mutex);
-    WexCudaNr2Model *model=wex_cuda_nr2_find(id);
-    if(!model || device<0 || device>=WEX_CUDA_NR2_MAX_DEVICES) return 1;
+    if(device<0 || device>=WEX_CUDA_NR2_MAX_DEVICES) return 1;
     const int buckets=WEX_CUDA_NR2_LOOKUP==0;
-    if(!model->tables[device]) {
-        unsigned char *base=nullptr;
+    WexCudaNr2Model *model=wex_cuda_nr2_find(id);
+    if(!model) return 1;
+    unsigned char *base=model->tables[device].load(std::memory_order_acquire);
+    if(base) { wex_cuda_nr2_table_view(base,buckets,tables); return 0; }
+    std::lock_guard<std::mutex> lock(wex_cuda_nr2_mutex);
+    base=model->tables[device].load(std::memory_order_relaxed);
+    if(!base) {
         if(cudaMalloc((void**)&base,wex_cuda_nr2_table_bytes(buckets))!=cudaSuccess) { (void)cudaGetLastError(); return 1; }
         WexCudaNr2Tables built;
         if(cudaMemcpyAsync(base,model->blob,WEX_NR2_MODEL_BYTES,cudaMemcpyHostToDevice,stream)!=cudaSuccess ||
@@ -206,14 +211,13 @@ static int wex_cuda_nr2_tables(uint32_t id,int device,cudaStream_t stream,WexCud
             (void)cudaGetLastError(); cudaStreamSynchronize(stream); cudaFree(base); (void)cudaGetLastError();
             return 1;
         }
-        model->tables[device]=base;
+        model->tables[device].store(base,std::memory_order_release);
     }
-    wex_cuda_nr2_table_view(model->tables[device],buckets,tables);
+    wex_cuda_nr2_table_view(base,buckets,tables);
     return 0;
 }
 
 static int wex_cuda_nr2_registered(uint32_t id) {
-    std::lock_guard<std::mutex> lock(wex_cuda_nr2_mutex);
     return wex_cuda_nr2_find(id)!=nullptr;
 }
 
@@ -227,69 +231,81 @@ WEX_CUDA_EXPORT int wex_cuda_register_model(const unsigned char *blob,size_t byt
     std::lock_guard<std::mutex> lock(wex_cuda_nr2_mutex);
     if(WexCudaNr2Model *known=wex_cuda_nr2_find(probe.id))
         return std::memcmp(known->blob,blob,WEX_NR2_MODEL_BYTES) ? -1 : 0;
-    if(wex_cuda_nr2_count>=WEX_CUDA_NR2_MAX_MODELS) return 1;
+    int cnt=wex_cuda_nr2_count.load(std::memory_order_relaxed);
+    if(cnt>=WEX_CUDA_NR2_MAX_MODELS) return 1;
     WexCudaNr2Model *model=new(std::nothrow) WexCudaNr2Model();
     if(!model) return 1;
     model->id=probe.id;
     std::memcpy(model->blob,blob,WEX_NR2_MODEL_BYTES);
-    wex_cuda_nr2_models[wex_cuda_nr2_count++]=model;
+    wex_cuda_nr2_models[cnt]=model;
+    wex_cuda_nr2_count.store(cnt+1,std::memory_order_release);
     return 0;
 }
 
-/* ---- WNR4 (codec 8, kind MX) model registry and decode ------------------- */
+/* ---- WNR4 (codec 8, kind MX / NV) model registry and decode -------------- */
 struct WexCudaWnr4Model {
     Wnr4Model host;
-    unsigned char *dev[WEX_CUDA_NR2_MAX_DEVICES]={};
+    std::atomic<unsigned char *> dev[WEX_CUDA_NR2_MAX_DEVICES];
     Wnr4CudaTables tab[WEX_CUDA_NR2_MAX_DEVICES]={};
+    WexCudaWnr4Model() : host{} { for(int i=0;i<WEX_CUDA_NR2_MAX_DEVICES;i++) dev[i].store(nullptr,std::memory_order_relaxed); }
 };
 static std::mutex wex_cuda_wnr4_mutex;
 static WexCudaWnr4Model *wex_cuda_wnr4_models[WEX_CUDA_NR2_MAX_MODELS];
-static int wex_cuda_wnr4_count;
+static std::atomic<int> wex_cuda_wnr4_count{0};
 
 WEX_CUDA_EXPORT int wex_cuda_register_wnr4_model(const unsigned char *blob,size_t bytes) {
     Wnr4Model probe;
-    if(!blob || wnr4_model_open(blob,bytes,&probe) || probe.kind!=WNR4_KIND_MX) return -1;
+    if(!blob || wnr4_model_open(blob,bytes,&probe) || (probe.kind!=WNR4_KIND_MX && probe.kind!=WNR4_KIND_NV)) return -1;
     std::lock_guard<std::mutex> lock(wex_cuda_wnr4_mutex);
-    for(int i=0;i<wex_cuda_wnr4_count;i++)
+    int cnt=wex_cuda_wnr4_count.load(std::memory_order_relaxed);
+    for(int i=0;i<cnt;i++)
         if(wex_cuda_wnr4_models[i]->host.id==probe.id) { wnr4_model_free(&probe); return 0; }
-    if(wex_cuda_wnr4_count>=WEX_CUDA_NR2_MAX_MODELS) { wnr4_model_free(&probe); return 1; }
+    if(cnt>=WEX_CUDA_NR2_MAX_MODELS) { wnr4_model_free(&probe); return 1; }
     WexCudaWnr4Model *m=new(std::nothrow) WexCudaWnr4Model();
     if(!m) { wnr4_model_free(&probe); return 1; }
     m->host=probe;
-    wex_cuda_wnr4_models[wex_cuda_wnr4_count++]=m;
+    wex_cuda_wnr4_models[cnt]=m;
+    wex_cuda_wnr4_count.store(cnt+1,std::memory_order_release);
     return 0;
 }
 
 static int wex_cuda_wnr4_tables(uint32_t id,int device,const Wnr4Model **host_out,const Wnr4CudaTables **tab_out) {
     if(device<0 || device>=WEX_CUDA_NR2_MAX_DEVICES) return 1;
-    std::lock_guard<std::mutex> lock(wex_cuda_wnr4_mutex);
+    int cnt=wex_cuda_wnr4_count.load(std::memory_order_acquire);
     WexCudaWnr4Model *m=nullptr;
-    for(int i=0;i<wex_cuda_wnr4_count;i++)
+    for(int i=0;i<cnt;i++)
         if(wex_cuda_wnr4_models[i]->host.id==id) { m=wex_cuda_wnr4_models[i]; break; }
     if(!m) return 1;
-    if(!m->dev[device]) {
+    if(m->dev[device].load(std::memory_order_acquire)) {
+        *host_out=&m->host; *tab_out=&m->tab[device];
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(wex_cuda_wnr4_mutex);
+    if(!m->dev[device].load(std::memory_order_relaxed)) {
         std::vector<unsigned char> img(wnr4_cuda_table_bytes(&m->host));
         wnr4_cuda_table_image(&m->host,img.data());
-        if(cudaSetDevice(device)!=cudaSuccess || cudaMalloc(&m->dev[device],img.size())!=cudaSuccess ||
-           cudaMemcpy(m->dev[device],img.data(),img.size(),cudaMemcpyHostToDevice)!=cudaSuccess) {
+        unsigned char *dp=nullptr;
+        if(cudaSetDevice(device)!=cudaSuccess || cudaMalloc(&dp,img.size())!=cudaSuccess ||
+           cudaMemcpy(dp,img.data(),img.size(),cudaMemcpyHostToDevice)!=cudaSuccess) {
             (void)cudaGetLastError();
-            if(m->dev[device]) { cudaFree(m->dev[device]); m->dev[device]=nullptr; }
+            if(dp) cudaFree(dp);
             return 1;
         }
-        wnr4_cuda_tables_view(&m->host,m->dev[device],&m->tab[device]);
+        wnr4_cuda_tables_view(&m->host,dp,&m->tab[device]);
+        m->dev[device].store(dp,std::memory_order_release);
     }
     *host_out=&m->host;
     *tab_out=&m->tab[device];
     return 0;
 }
 
-static int wex_cuda_wnr4_geo(const WexEntry *entry,Wnr4Geo *g) {
+static int wex_cuda_wnr4_geo(const WexEntry *entry,uint32_t kind,Wnr4Geo *g) {
     uint32_t scount[3],scols[3];
     for(int m=0;m<3;m++) {
         scount[m]=(uint32_t)entry->scale_shapes[m][0]*entry->scale_shapes[m][1];
         scols[m]=entry->scale_shapes[m][1];
     }
-    return wnr4_geo(g,WNR4_KIND_MX,scount,scols,entry->scale_offsets,entry->weight_offsets);
+    return wnr4_geo(g,kind,scount,scols,entry->scale_offsets,entry->weight_offsets);
 }
 
 struct WexCudaWnr4Lane {
@@ -455,7 +471,7 @@ static int wex_cuda_wnr4_batch(int n,const WexEntry *const *entries,const unsign
             const int i=idxs[j];
             const WexEntry *e=entries[i];
             Wnr4Geo geo;
-            if(wex_cuda_wnr4_geo(e,&geo)) { status[i]=-1; continue; }
+            if(wex_cuda_wnr4_geo(e,hmodel->kind,&geo)) { status[i]=-1; continue; }
             unsigned char *ds[3],*dw[3];
             for(int m=0;m<3;m++) {
                 ds[m]=dst_host ? b.draw+b.raw_at[(size_t)i]+e->scale_offsets[m] : dst_scale[3*i+m];

@@ -423,6 +423,8 @@ an older helper that lacks a bit:
 | 8 | `wex_cuda_decode_batch_to_device` | n records into device buffers, pipelined over 8 lanes, one host wait |
 | 16 | (no new function) | WNR3 records (codec 5) in every decode entry point, with their per-stream hash, ceil-form and canonical-zero checks |
 | 32 | `wex_cuda_decode_batch_to_host` | n records into caller host buffers (each record's canonical slab) |
+| 64 | `wex_cuda_register_wnr4_model` | WNR4-MX/NV records (codec 8, 32-lane warp-parallel rANS tiles) in every decode entry point |
+| 128 | `wex_cuda_decode_batch_to_host_scratch` | n records into caller scratch host buffers (single sync, D2H overlapped behind decode) |
 
 Every entry point returns 0 (decoded and written), -1 (an invalid record or one that fails an
 integrity check: the destination is untouched) or 1 (CUDA or memory unavailable, or the model
@@ -464,8 +466,36 @@ other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1, Qwen3.8 and GLM-5.3-Flash read RAW and WNR3 records from a WEX4 container; WNR3
-records decode on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU
-otherwise (the fast decoder where the CPU has its kernel). qwen38 and deepseek_v41 also read copies of the container on other drives. A
-container mirror for `deepseek_v4` and the engines' use of the helper's device and batch
-calls are the next PRs.
+DeepSeek V4, DeepSeek V4.1, Qwen3.8 and GLM-5.3-Flash read RAW, WNR3 (codec 5) and WNR4-MX (codec 8)
+records from a WEX4 container; WNR3 and WNR4-MX records decode on the GPU when `COLI_WEX_CUDA_LIB`
+names the CUDA helper (`make -C c wex-cuda-helper`), and on the CPU otherwise (fast AVX2/NEON for WNR3,
+scalar reference for WNR4). qwen38 and deepseek_v41 also read copies of the container on other drives
+(`COLI_MODEL_MIRROR`), and `deepseek_v41` overlaps NVMe reads, streaming SHA-256 verification, and
+batched GPU WNR3/WNR4 decode.
+
+### Quick test with published WNR4-MX containers
+
+Pre-packed WEX4/WNR4-MX containers live in [Kaira666/Kaira-WEX4-Experts](https://huggingface.co/Kaira666/Kaira-WEX4-Experts):
+
+```sh
+# Build the CUDA helper (Linux: c/kaira_wex_cuda.so; Windows: c/kaira_wex_cuda.dll)
+make -C c wex-cuda-helper
+
+# DeepSeek-V4.1-Flash-1017 REAP-192 (WNR4-MX, 122.87 GB, value-exact):
+#   v41-reap/v4_flash_experts.wnr4.wex
+COLI_CUDA=1 \
+COLI_WEX_PATH=/path/to/v4_flash_experts.wnr4.wex \
+COLI_WEX_ROOT=75520a3b0a52f161a02cafebc94d57e58ef2c4ccfbff5b4ba637cc3d66252e30 \
+COLI_WEX_CUDA_LIB=$PWD/c/kaira_wex_cuda.so \
+COLI_WEX_STATS=1 \
+./c/coli chat --model /path/to/DeepSeek-V4.1-Flash-1017-REAP192-MXFP4
+
+# Qwen3.8-Flash-Next 125B-A6B MXFP4 (WNR4-MX, 56.85 GB, byte-exact):
+#   qwen38-mxfp4/q38_experts.wnr4.wex
+COLI_CUDA=1 \
+COLI_WEX_PATH=/path/to/q38_experts.wnr4.wex \
+COLI_WEX_ROOT=68745b781dd947e57c4cacabe2c87e21bfa606559320cf3486ba87ee051d87b9 \
+COLI_WEX_CUDA_LIB=$PWD/c/kaira_wex_cuda.so \
+COLI_WEX_STATS=1 \
+./c/coli chat --model /path/to/Qwen3.8-Flash-Next-FP8
+```

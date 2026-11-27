@@ -2310,21 +2310,35 @@ static void g53_wex4_attach(GModel *m, const char *path) {
     unsigned char *sha = malloc(cells * 32);
     if (!w->off || !sha) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
     for (size_t k = 0; k < cells; k++) w->off[k] = -1;
-    int nr3 = 0, exact = 0;
-    uint32_t model_blob = 0;   /* the WNR3 records' WNM2 blob, 1-based */
+    int nr3 = 0, nr4 = 0, exact = 0, wnr4_cz = -1;
+    uint32_t model_blob = 0;   /* the WNR3/WNR4 records' WNM2/WNM4 blob, 1-based */
     for (uint32_t r = 0; r < h.records; r++) {
         Wex4Record rec;
         wex4_get_record(&view, r, &rec);
         if (!(rec.flags & WEX4_REC_EXPERT)) continue;   /* the other tensors: the shards serve them */
         const int layer = (int)(rec.owner >> 16), expert = (int)(rec.owner & 0xffffu);   /* bounded by wex4_open */
+        const int is_nr3 = rec.codec == WEX4_CODEC_WNR3, is_nr4 = rec.codec == WEX4_CODEC_WNR4;
         const size_t cell = (size_t)layer * c->n_experts + expert;
-        if (rec.codec == WEX4_CODEC_WNR3) {   /* wex4_open admits RAW and WNR3 expert records, a WNR3 one with a WNM2 blob */
-            if (model_blob && rec.blob != model_blob) g53_wex_refuse(path, "it has WNR3 records of two models (one is read)");
+        if (is_nr3 || is_nr4) {   /* wex4_open admits RAW, WNR3 and WNR4 expert records */
+            if ((nr3 && is_nr4) || (nr4 && is_nr3)) g53_wex_refuse(path, "it mixes WNR3 and WNR4 expert records");
+            if (model_blob && rec.blob != model_blob) g53_wex_refuse(path, "it has coded records of two models (one is read)");
             model_blob = rec.blob;
             if (!w->nr3 && !(w->nr3 = calloc(cells, sizeof(WexEntry)))) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
-            if (wex4_expert_entry(&view, r, &w->nr3[cell])) g53_wex_refuse(path, "it has an invalid WNR3 expert record");
-            nr3++;
-            exact += !!(rec.flags & WEX4_REC_VALUE_EXACT);
+            if (wex4_expert_entry(&view, r, &w->nr3[cell]))
+                g53_wex_refuse(path, is_nr4 ? "it has an invalid WNR4 expert record" : "it has an invalid WNR3 expert record");
+            if (is_nr4) {
+                nr4++;
+                if (wnr4_cz < 0) {
+                    unsigned char *rpage = malloc(WEX4_PAGE);
+                    if (!rpage) { fprintf(stderr, "OOM WEX4 WNR4 header\n"); exit(1); }
+                    st_pread_full(w->fd, rpage, WEX4_PAGE, (int64_t)rec.offset, "pread WNR4 record header");
+                    wnr4_cz = !!(rpage[13] & 8u) || !!(rec.flags & WEX4_REC_VALUE_EXACT);
+                    free(rpage);
+                }
+            } else {
+                nr3++;
+                exact += !!(rec.flags & WEX4_REC_VALUE_EXACT);
+            }
         }
         int ok = rec.decoded == (uint64_t)m->e_slot && rec.tensor_count == 6;
         for (int part = 0; part < 6 && ok; part++) {
@@ -2352,20 +2366,25 @@ static void g53_wex4_attach(GModel *m, const char *path) {
                 snprintf(why, sizeof why, "layer %d expert %d is not in it", layer, expert);
                 g53_wex_refuse(path, why);
             }
-    char model[48] = "";
-    if (model_blob) {   /* the WNM2 model, checked against its SHA-256 in the index, registered for the decode */
-        if (exact && exact != nr3) g53_wex_refuse(path, "it has WNR3 records both value-exact and not (all or none are read)");
+    char model[64] = "";
+    if (model_blob) {   /* the WNM2/WNM4 model, checked against its SHA-256 in the index, registered for the decode */
+        if (!nr4 && exact && exact != nr3) g53_wex_refuse(path, "it has WNR3 records both value-exact and not (all or none are read)");
         Wex4Blob blob;
         wex4_get_blob(&view, model_blob - 1u, &blob);
         const size_t stored = (size_t)wex4_align(blob.bytes);
         unsigned char *bytes = malloc(stored);
         if (!bytes) { fprintf(stderr, "OOM WEX4 model blob\n"); exit(1); }
         st_pread_full(w->fd, bytes, (int64_t)stored, (int64_t)blob.offset, "pread WEX4 model blob");
-        if (coli_wex4_register_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id))
-            g53_wex_refuse(path, "its WNM2 model blob does not match its SHA-256 in the index");
+        const int bad = nr4 ? coli_wex4_register_wnr4_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id)
+                            : coli_wex4_register_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id);
         free(bytes);
-        w->nr3_flags = exact ? WEX_HEADER_CANONICAL_ZERO : 0u;
-        snprintf(model, sizeof model, " (%d WNR3, model %08x%s)", nr3, blob.id, exact ? ", value-exact" : "");
+        if (bad)
+            g53_wex_refuse(path, nr4 ? "its WNM4 model blob does not match its SHA-256 in the index"
+                                     : "its WNM2 model blob does not match its SHA-256 in the index");
+        const int cz_on = nr4 ? (wnr4_cz > 0) : (exact > 0);
+        w->nr3_flags = cz_on ? WEX_HEADER_CANONICAL_ZERO : 0u;
+        snprintf(model, sizeof model, " (%d %s, model %08x%s)", nr4 ? nr4 : nr3, nr4 ? "WNR4" : "WNR3",
+                 blob.id, cz_on ? ", value-exact" : "");
     }
     const char *verify = getenv("COLI_WEX_VERIFY");
     if (verify && *verify ? atoi(verify) != 0 : pinned > 0) {
@@ -2410,7 +2429,7 @@ static void g53_wex_check(GModel *m, size_t cell, int layer, int eid, const uint
 static void g53_wex_read(GModel *m, int layer, int eid, Slot *slot) {
     G53Wex *w = m->wex;
     const size_t cell = (size_t)layer * m->c.n_experts + eid, page = (size_t)wex4_align((uint64_t)m->e_slot);
-    const WexEntry *nr3 = w->nr3 && w->nr3[cell].flags == WEX_ENTRY_NEURAL_RANS3 ? &w->nr3[cell] : NULL;
+    const WexEntry *nr3 = w->nr3 && (w->nr3[cell].flags == WEX_ENTRY_NEURAL_RANS3 || w->nr3[cell].flags == WEX_ENTRY_WNR4) ? &w->nr3[cell] : NULL;
     if (slot->own && slot->own_len < page) g53_slot_free(slot);
     if (!slot->own) {
         void *p = NULL;
